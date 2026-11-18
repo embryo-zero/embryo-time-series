@@ -1,0 +1,140 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.table;
+
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.RowCursor;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import org.jetbrains.annotations.NotNull;
+
+class LatestByValueIndexedFilteredRecordCursor extends AbstractLatestByValueRecordCursor {
+    private final Function filter;
+    private SqlExecutionCircuitBreaker circuitBreaker;
+
+    public LatestByValueIndexedFilteredRecordCursor(
+            @NotNull CairoConfiguration configuration,
+            @NotNull RecordMetadata metadata,
+            int columnIndex,
+            int symbolKey,
+            @NotNull Function filter
+    ) {
+        super(configuration, metadata, columnIndex, symbolKey);
+        this.filter = filter;
+    }
+
+    @Override
+    public boolean hasNext() {
+        circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+        if (!isFindPending) {
+            findRecord();
+            hasNext = isRecordFound;
+            isFindPending = true;
+        }
+        if (hasNext) {
+            hasNext = false;
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void of(PageFrameCursor pageFrameCursor, SqlExecutionContext executionContext) throws SqlException {
+        this.frameCursor = pageFrameCursor;
+        recordA.of(pageFrameCursor);
+        recordB.of(pageFrameCursor);
+        circuitBreaker = executionContext.getCircuitBreaker();
+        filter.init(pageFrameCursor, executionContext);
+        isRecordFound = false;
+        isFindPending = false;
+        // prepare for page frame iteration
+        super.init(executionContext.getMemoryTracker());
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return isFindPending ? 1 : 0;
+    }
+
+    @Override
+    public void setSymbolKey(int symbolKey) {
+        super.setSymbolKey(TableUtils.toIndexKey(symbolKey));
+    }
+
+    @Override
+    public long size() {
+        return -1;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Index backward scan").meta("on").putColumnName(columnIndex);
+        sink.optAttr("filter", filter);
+    }
+
+    @Override
+    public void toTop() {
+        hasNext = isRecordFound;
+        filter.toTop();
+    }
+
+    private void findRecord() {
+        PageFrame frame;
+        while ((frame = frameCursor.next()) != null) {
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            final IndexReader indexReader = frame.getIndexReader(columnIndex, IndexReader.DIR_BACKWARD);
+            final long indexRowLo = frame.getIndexRowLo();
+            final long indexRowHi = frame.getIndexRowHi() - 1;
+
+            frameAddressCache.add(frameCount, frame);
+            frameMemoryPool.navigateTo(frameCount++, recordA);
+
+            try (RowCursor cursor = indexReader.getCursor(symbolKey, indexRowLo, indexRowHi)) {
+                while (cursor.hasNext()) {
+                    // Per the IndexReader.getCursor(key, minValue, maxValue) contract, returned rows are
+                    // already relative to minValue == indexRowLo here, so cursor.next() is already
+                    // frame-relative. Subtracting indexRowLo again here positioned the record indexRowLo
+                    // rows too early whenever the match fell in a page frame with indexRowLo > 0,
+                    // returning a neighbouring row (often a different symbol). For a COMPOSITE partition
+                    // indexRowLo carries the piece's file-row shift, the same shift the frame's page
+                    // addresses carry, so the un-subtracted row lines up there too.
+                    recordA.setRowIndex(cursor.next());
+                    if (filter.getBool(recordA)) {
+                        isRecordFound = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}

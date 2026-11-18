@@ -1,0 +1,139 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.table;
+
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.EmptyTableRandomRecordCursor;
+import io.questdb.griffin.engine.EmptyTableRecordCursor;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+abstract class AbstractDeferredValueRecordCursorFactory extends AbstractPageFrameRecordCursorFactory {
+    protected final int columnIndex;
+    protected final IntList columnIndexes;
+    protected Function filter;
+    private AbstractLatestByValueRecordCursor cursor;
+    private Function symbolFunc;
+    private int symbolKey = SymbolTable.VALUE_NOT_FOUND;
+
+    public AbstractDeferredValueRecordCursorFactory(
+            @NotNull RecordMetadata metadata,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
+            int columnIndex,
+            Function symbolFunc,
+            @Nullable Function filter,
+            @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts
+    ) {
+        super(metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
+        this.columnIndex = columnIndex;
+        this.symbolFunc = symbolFunc;
+        this.filter = filter;
+        this.columnIndexes = columnIndexes;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.optAttr("filter", filter);
+        sink.attr("symbolFilter").putColumnName(columnIndex).val('=').val(symbolFunc);
+        sink.child(partitionFrameCursorFactory);
+    }
+
+    private boolean lookupDeferredSymbol(PageFrameCursor pageFrameCursor) {
+        symbolKey = pageFrameCursor.getSymbolTable(columnIndex).keyOf(symbolFunc.getStrA(null), symbolKey);
+        if (symbolKey == SymbolTable.VALUE_NOT_FOUND) {
+            pageFrameCursor.close();
+            return true;
+        }
+
+        if (cursor != null) {
+            cursor.setSymbolKey(symbolKey);
+        } else {
+            cursor = createCursorFor(symbolKey);
+        }
+
+        return false;
+    }
+
+    @Override
+    protected void _close() {
+        final AbstractLatestByValueRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final Function filter = this.filter;
+        this.filter = null;
+        final Function symbolFunc = this.symbolFunc;
+        this.symbolFunc = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
+        }
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeBestEffort(failure, filter);
+        if (symbolFunc != filter) {
+            failure = Misc.freeBestEffort(failure, symbolFunc);
+        }
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    protected abstract AbstractLatestByValueRecordCursor createCursorFor(int symbolKey);
+
+    @Override
+    protected RecordCursor initRecordCursor(
+            PageFrameCursor pageFrameCursor,
+            SqlExecutionContext executionContext
+    ) throws SqlException {
+        symbolFunc.init(pageFrameCursor, executionContext);
+
+        if (lookupDeferredSymbol(pageFrameCursor)) {
+            // The deferred symbol is absent, so this returns a shared empty cursor that never checks the
+            // breaker on its own. Consult it once at open so the query still observes cancellation.
+            executionContext.getCircuitBreaker().statefulThrowExceptionIfTrippedTimeThrottledOrYield();
+            if (recordCursorSupportsRandomAccess()) {
+                return EmptyTableRandomRecordCursor.INSTANCE;
+            }
+            return EmptyTableRecordCursor.INSTANCE;
+        }
+        try {
+            cursor.of(pageFrameCursor, executionContext);
+            return cursor;
+        } catch (Throwable th) {
+            Misc.free(cursor, th);
+            throw th;
+        }
+    }
+}

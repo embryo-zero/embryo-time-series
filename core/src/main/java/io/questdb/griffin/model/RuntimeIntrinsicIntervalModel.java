@@ -1,0 +1,61 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.model;
+
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.griffin.Plannable;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.std.LongList;
+import io.questdb.std.QuietCloseable;
+
+public interface RuntimeIntrinsicIntervalModel extends QuietCloseable, Plannable {
+
+    boolean allIntervalsHitOnePartition();
+
+    LongList calculateIntervals(SqlExecutionContext sqlExecutionContext) throws SqlException;
+
+    TimestampDriver getTimestampDriver();
+
+    /**
+     * Fail-safe determinism contract mirroring {@code RecordCursorFactory#isNonDeterministic()}:
+     * returns {@code true} unless the model can prove its intervals are stable across two
+     * evaluations (static intervals, or dynamic bounds that are all deterministic).
+     */
+    default boolean isNonDeterministic() {
+        return true;
+    }
+
+    /**
+     * Returns {@code true} if repeated interval calculations within one query execution produce
+     * the same intervals. The default stays fail-safe by deriving from determinism; runtime
+     * models may prove the weaker property for execution-scoped bound functions.
+     */
+    default boolean isStableWithinExecution() {
+        return !isNonDeterministic();
+    }
+
+    boolean isStatic();
+}

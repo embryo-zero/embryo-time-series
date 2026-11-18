@@ -1,0 +1,697 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.table;
+
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypeDriver;
+import io.questdb.cairo.ColumnVersionReader;
+import io.questdb.cairo.ParquetMetaFileReader;
+import io.questdb.cairo.PartitionGeometry;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.ColumnMapping;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PartitionFormat;
+import io.questdb.cairo.sql.PartitionFrame;
+import io.questdb.cairo.sql.PartitionFrameCursor;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.vm.MemoryCARWImpl;
+import io.questdb.cairo.vm.NullMemoryCMR;
+import io.questdb.cairo.vm.api.MemoryR;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.table.parquet.ParquetPartitionDecoder;
+import io.questdb.std.DirectLongList;
+import io.questdb.std.IntList;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import org.jetbrains.annotations.Nullable;
+
+public class FwdTableReaderPageFrameCursor implements TablePageFrameCursor {
+    private final int columnCount;
+    private final IntList columnIndexes;
+    private final ColumnMapping columnMapping = new ColumnMapping();
+    private final LongList columnPageAddresses = new LongList();
+    private final IntList columnSizeShifts;
+    private final DirectLongList filterList;
+    private final MemoryCARWImpl filterValues;
+    private final TableReaderPageFrame frame = new TableReaderPageFrame();
+    private final LongList pageSizes = new LongList();
+    private final @Nullable ObjList<PushdownFilterExtractor.PushdownFilterCondition> pushdownFilterConditions;
+    private final int sharedQueryWorkerCount;
+    private int cachedRowGroupIndex;
+    private long cachedRowGroupStartRow;
+    private long filterBufEnd = -1;
+    // Track the lowest partition index that has not been released yet
+    private int lowestOpenPartitionIndex = 0;
+    private int pageFrameMaxRows;
+    private int pageFrameMinRows;
+    private PartitionFrameCursor partitionFrameCursor;
+    private TableReader reader;
+    // only native partition frames are reentered
+    private long reenterPageFrameRowLimit;
+    private ParquetPartitionDecoder reenterParquetDecoder;
+    private boolean reenterPartitionFrame = false; // true when the current Partition Frame is not entirely exhausted
+    private long reenterPartitionHi;
+    private int reenterPartitionIndex;
+    private long reenterPartitionLo;
+    private long remainingRowsInInterval;
+
+    public FwdTableReaderPageFrameCursor(
+            IntList columnIndexes,
+            IntList columnSizeShifts,
+            @Nullable ObjList<PushdownFilterExtractor.PushdownFilterCondition> pushdownFilterConditions,
+            int sharedQueryWorkerCount
+    ) {
+        this.columnIndexes = columnIndexes;
+        this.columnSizeShifts = columnSizeShifts;
+        this.columnCount = columnIndexes.size();
+        this.sharedQueryWorkerCount = sharedQueryWorkerCount;
+        this.pushdownFilterConditions = pushdownFilterConditions;
+        if (pushdownFilterConditions != null && pushdownFilterConditions.size() > 0) {
+            this.filterList = new DirectLongList(
+                    (long) pushdownFilterConditions.size() * ParquetRowGroupFilter.LONGS_PER_FILTER,
+                    MemoryTag.NATIVE_PARQUET_PARTITION_DECODER,
+                    true
+            );
+            this.filterValues = new MemoryCARWImpl(
+                    ParquetRowGroupFilter.FILTER_BUFFER_PAGE_SIZE,
+                    ParquetRowGroupFilter.FILTER_BUFFER_MAX_PAGES,
+                    MemoryTag.NATIVE_PARQUET_PARTITION_DECODER
+            );
+        } else {
+            this.filterList = null;
+            this.filterValues = null;
+        }
+    }
+
+    @Override
+    public void calculateSize(RecordCursor.Counter counter) {
+        partitionFrameCursor.calculateSize(counter);
+    }
+
+    @Override
+    public void close() {
+        partitionFrameCursor = Misc.free(partitionFrameCursor);
+        Misc.free(filterList);
+        Misc.free(filterValues);
+    }
+
+    @Override
+    public ColumnMapping getColumnMapping() {
+        return columnMapping;
+    }
+
+    @Override
+    public LongList getIntervals() {
+        return partitionFrameCursor != null ? partitionFrameCursor.getIntervals() : null;
+    }
+
+    @Override
+    public long getRemainingRowsInInterval() {
+        return remainingRowsInInterval;
+    }
+
+    @Override
+    public StaticSymbolTable getSymbolTable(int columnIndex) {
+        return reader.getSymbolTable(columnIndexes.getQuick(columnIndex));
+    }
+
+    @Override
+    public TableReader getTableReader() {
+        return reader;
+    }
+
+    @Override
+    public boolean hasActivePushdownFilter() {
+        return pushdownFilterConditions != null && pushdownFilterConditions.size() > 0;
+    }
+
+    @Override
+    public boolean hasIntervalFilter() {
+        return partitionFrameCursor != null && partitionFrameCursor.hasIntervalFilter();
+    }
+
+    @Override
+    public SymbolTable newSymbolTable(int columnIndex) {
+        return reader.newSymbolTable(columnIndexes.getQuick(columnIndex));
+    }
+
+    @Override
+    public @Nullable PageFrame next(long skipTarget) {
+        while (true) {
+            if (reenterPartitionFrame) {
+                if (reenterParquetDecoder != null) {
+                    final TableReaderPageFrame result = computeParquetFrame(reenterPartitionLo, reenterPartitionHi);
+                    if (result != null) {
+                        return result;
+                    }
+                    continue;
+                } else {
+                    return computeNativeFrame(reenterPartitionLo, reenterPartitionHi, skipTarget);
+                }
+            }
+
+            final PartitionFrame partitionFrame = partitionFrameCursor.next(skipTarget);
+            if (partitionFrame != null) {
+                reenterPartitionIndex = partitionFrame.getPartitionIndex();
+                final long lo = partitionFrame.getRowLo();
+                final long hi = partitionFrame.getRowHi();
+
+                if (hi - lo <= skipTarget) {
+                    frame.partitionIndex = reenterPartitionIndex;
+                    frame.partitionLo = lo;
+                    frame.partitionHi = hi;
+                    frame.pieceShift = 0;
+                    frame.skipSkeleton = true;
+                    frame.format = partitionFrame.getPartitionFormat();
+                    frame.rowGroupIndex = -1;
+                    frame.rowGroupLo = -1;
+                    frame.rowGroupHi = -1;
+                    if (frame.format == PartitionFormat.PARQUET) {
+                        frame.parquetMetaDecoder = partitionFrame.getParquetMetaDecoder();
+                    } else {
+                        frame.parquetMetaDecoder = null;
+                    }
+
+                    return frame;
+                }
+                final TableReaderPageFrame result = nextSlow(partitionFrame, lo, hi, skipTarget);
+                if (result != null) {
+                    return result;
+                }
+                continue;
+            }
+            return null;
+        }
+    }
+
+    @Override
+    public TablePageFrameCursor of(SqlExecutionContext executionContext, PartitionFrameCursor partitionFrameCursor) throws SqlException {
+        this.partitionFrameCursor = partitionFrameCursor;
+        this.reader = partitionFrameCursor.getTableReader();
+        TablePageFrameCursor.buildColumnMapping(columnMapping, columnIndexes, reader.getMetadata());
+        this.pageFrameMinRows = executionContext.getPageFrameMinRows();
+        this.pageFrameMaxRows = executionContext.getPageFrameMaxRows();
+        if (pushdownFilterConditions != null) {
+            for (int i = 0, n = pushdownFilterConditions.size(); i < n; i++) {
+                pushdownFilterConditions.getQuick(i).init(executionContext);
+            }
+        }
+        toTop();
+        return this;
+    }
+
+    @Override
+    public void releaseOpenPartitions() {
+        // Guard against being called before next() when no partitions need releasing.
+        if (lowestOpenPartitionIndex >= reenterPartitionIndex) {
+            return;
+        }
+        // Close all partitions from lowestOpenPartitionIndex up to (but not including) current partition
+        for (int i = lowestOpenPartitionIndex; i < reenterPartitionIndex; i++) {
+            reader.closePartitionByIndex(i);
+        }
+        lowestOpenPartitionIndex = reenterPartitionIndex;
+    }
+
+    @Override
+    public long size() {
+        return partitionFrameCursor.size();
+    }
+
+    @Override
+    public boolean supportsSizeCalculation() {
+        return partitionFrameCursor.supportsSizeCalculation();
+    }
+
+    @Override
+    public void toPartition(int targetPartitionIndex) {
+        partitionFrameCursor.toPartition(targetPartitionIndex);
+        reenterPartitionFrame = false;
+        reenterParquetDecoder = null;
+        clearAddresses();
+    }
+
+    @Override
+    public void toTop() {
+        partitionFrameCursor.toTop();
+        reenterPartitionFrame = false;
+        reenterParquetDecoder = null;
+        lowestOpenPartitionIndex = 0;
+        remainingRowsInInterval = 0;
+        cachedRowGroupIndex = 0;
+        cachedRowGroupStartRow = 0;
+        filterBufEnd = -1;
+        clearAddresses();
+    }
+
+    private void clearAddresses() {
+        columnPageAddresses.setAll(2 * columnCount, 0);
+        pageSizes.setAll(2 * columnCount, -1);
+    }
+
+    private TableReaderPageFrame computeNativeFrame(long partitionLo, long partitionHi, long skipTarget) {
+        if (skipTarget > 0) {
+            return computeNativeSkipFrame(partitionLo, partitionHi, skipTarget);
+        }
+
+        final int base = reader.getColumnBase(reenterPartitionIndex);
+
+        // we may need to split this partition frame either along "top" lines, or along
+        // max page frame sizes; to do this, we calculate min top value from given position
+        long adjustedHi = Math.min(partitionHi, partitionLo + reenterPageFrameRowLimit);
+
+        // A COMPOSITE partition is several PIECES over one set of column files, and each piece sits at its own place in
+        // those files.
+        long pieceShift = 0;
+        if (reader.getTxFile().isPartitionComposite(reenterPartitionIndex)) {
+            final PartitionGeometry geometry = reader.getGeometry();
+            final int piece = geometry.findPieceByRow(reenterPartitionIndex, partitionLo);
+            pieceShift = geometry.getPieceShift(reenterPartitionIndex, piece);
+            final long pieceHi = geometry.getPieceCumulativeLo(reenterPartitionIndex, piece)
+                    + geometry.getPieceRowCount(reenterPartitionIndex, piece);
+            if (pieceHi > partitionLo && pieceHi < adjustedHi) {
+                adjustedHi = pieceHi;
+            }
+        }
+
+        // Split along the column tops, which has to happen AFTER the piece is known: a top is a FILE row and
+        // partitionLo/adjustedHi are PARTITION rows, so the two are only comparable once the piece's shift is in hand.
+        for (int i = 0; i < columnCount; i++) {
+            final int columnIndex = columnIndexes.getQuick(i);
+            final long top = reader.getColumnTop(base, columnIndex) - pieceShift;
+            if (top > partitionLo && top < adjustedHi) {
+                adjustedHi = top;
+            }
+        }
+
+        for (int i = 0; i < columnCount; i++) {
+            final int columnIndex = columnIndexes.getQuick(i);
+            final int readerColIndex = TableReader.getPrimaryColumnIndex(base, columnIndex);
+            final MemoryR colMem = reader.getColumn(readerColIndex);
+            // When the entire column is NULL we make it skip the whole of the partition frame, by handing the
+            // arithmetic below a top that cancels the frame's own high row exactly.
+            final long top = colMem instanceof NullMemoryCMR
+                    ? adjustedHi + pieceShift
+                    : reader.getColumnTop(base, columnIndex);
+            final long partitionLoAdjusted = partitionLo + pieceShift - top;
+            final long partitionHiAdjusted = adjustedHi + pieceShift - top;
+            final int sh = columnSizeShifts.getQuick(i);
+
+            if (partitionHiAdjusted > 0) {
+                if (sh > -1) {
+                    // this assumes reader uses single page to map the whole column
+                    // non-negative sh means fixed length column
+                    final long address = colMem.getPageAddress(0);
+                    final long addressSize = partitionHiAdjusted << sh;
+                    final long offset = partitionLoAdjusted << sh;
+                    columnPageAddresses.setQuick(2 * i, address + offset);
+                    pageSizes.setQuick(2 * i, addressSize - offset);
+                } else {
+                    final int columnType = reader.getMetadata().getColumnType(columnIndex);
+                    final ColumnTypeDriver columnTypeDriver = ColumnType.getDriver(columnType);
+                    final MemoryR auxCol = reader.getColumn(readerColIndex + 1);
+                    final long auxAddress = auxCol.getPageAddress(0);
+                    final long auxOffsetLo = columnTypeDriver.getAuxVectorOffset(partitionLoAdjusted);
+                    final long auxOffsetHi = columnTypeDriver.getAuxVectorOffset(partitionHiAdjusted);
+
+                    final long dataSize = columnTypeDriver.getDataVectorSizeAt(auxAddress, partitionHiAdjusted - 1);
+                    // some var-size columns may not have data memory (fully inlined)
+                    final long dataAddress = dataSize > 0 ? colMem.getPageAddress(0) : 0;
+
+                    columnPageAddresses.setQuick(2 * i, dataAddress);
+                    columnPageAddresses.setQuick(2 * i + 1, auxAddress + auxOffsetLo);
+                    pageSizes.setQuick(2 * i, dataSize);
+                    pageSizes.setQuick(2 * i + 1, auxOffsetHi - auxOffsetLo);
+                }
+            } else { // column top
+                columnPageAddresses.setQuick(2 * i, 0);
+                columnPageAddresses.setQuick(2 * i + 1, 0);
+                // data page size is used by VectorAggregateFunction as the size hint
+                // in the following way:
+                //   size = page_size >>> column_size_hint
+                // (for var-sized types column_size_hint is 0)
+                pageSizes.setQuick(2 * i, (partitionHiAdjusted - partitionLoAdjusted) << (sh > -1 ? sh : 0));
+                pageSizes.setQuick(2 * i + 1, 0);
+            }
+        }
+
+        // it is possible that all columns in partition frame are empty, but it doesn't mean
+        // the partition frame size is 0; sometimes we may want to imply nulls
+        if (adjustedHi < partitionHi) {
+            reenterPartitionLo = adjustedHi;
+            reenterPartitionHi = partitionHi;
+            reenterPartitionFrame = true;
+        } else {
+            reenterPartitionFrame = false;
+        }
+
+        // remaining rows in the partition = size of the partition - max row number of the frame
+        remainingRowsInInterval = partitionHi - adjustedHi;
+
+        frame.partitionLo = partitionLo;
+        frame.partitionHi = adjustedHi;
+        frame.pieceShift = pieceShift;
+        frame.skipSkeleton = false;
+        frame.format = PartitionFormat.NATIVE;
+        frame.parquetMetaDecoder = null;
+        frame.rowGroupIndex = -1;
+        frame.rowGroupLo = -1;
+        frame.rowGroupHi = -1;
+        frame.partitionIndex = reenterPartitionIndex;
+        return frame;
+    }
+
+    /**
+     * One skip-only skeleton over {@code [partitionLo, skipHi)}, standing in for every frame the caller would
+     * otherwise have to walk and discard. The caller reads nothing but the row span off such a frame, so the
+     * span does not have to respect the piece, column-top or page-frame-size boundaries a readable frame is cut
+     * at - and not respecting them is the point. A COMPOSITE partition emits one readable frame per PIECE, and
+     * pricing each one probes the aux vector of every var-size column ({@code getDataVectorSizeAt}), faulting in
+     * a page of the mmapped aux file per column per frame. On a partition of thousands of pieces that walk, not
+     * the ten rows LIMIT -10 returns, is what the query spends its time on. Collapsed here, the skip over a
+     * partition costs one frame whatever its geometry.
+     * <p>
+     * The skeleton stops exactly at the skip target rather than one row past it, so the caller's
+     * {@code frameSize > skipTarget} landing test does not fire on it: it charges the whole skeleton against the
+     * skip, arrives with nothing left to skip, and the next call hands it a fully populated frame starting at the
+     * landing row.
+     */
+    private TableReaderPageFrame computeNativeSkipFrame(long partitionLo, long partitionHi, long skipTarget) {
+        final long skipHi = Math.min(partitionHi, partitionLo + skipTarget);
+        // Publish no addresses at all rather than the previous frame's: a skip-only frame still reaches
+        // PageFrameAddressCache, and a stale-but-plausible address there would read the wrong rows if anything
+        // ever navigated to it, whereas a zero address cannot be mistaken for a live one.
+        clearAddresses();
+
+        if (skipHi < partitionHi) {
+            reenterPartitionLo = skipHi;
+            reenterPartitionHi = partitionHi;
+            reenterPartitionFrame = true;
+        } else {
+            reenterPartitionFrame = false;
+        }
+        remainingRowsInInterval = partitionHi - skipHi;
+
+        frame.partitionLo = partitionLo;
+        frame.partitionHi = skipHi;
+        // A skeleton may span several pieces, so no single shift describes it. Nothing reads a shift off a frame
+        // the caller discards, and 0 is what the whole-partition skeleton in next(long) publishes.
+        frame.pieceShift = 0;
+        frame.skipSkeleton = true;
+        frame.format = PartitionFormat.NATIVE;
+        frame.parquetMetaDecoder = null;
+        frame.rowGroupIndex = -1;
+        frame.rowGroupLo = -1;
+        frame.rowGroupHi = -1;
+        frame.partitionIndex = reenterPartitionIndex;
+        return frame;
+    }
+
+    private @Nullable TableReaderPageFrame computeParquetFrame(long partitionLo, long partitionHi) {
+        final ParquetMetaFileReader metadata = reenterParquetDecoder.metadata();
+        final int rowGroupCount = metadata.getRowGroupCount();
+
+        if (partitionHi > metadata.getPartitionRowCount()) {
+            throw CairoException.critical(0)
+                    .put("parquet partition row count mismatch [partitionHi=").put(partitionHi)
+                    .put(", parquetRowCount=").put(metadata.getPartitionRowCount())
+                    .put(", partitionIndex=").put(reenterPartitionIndex)
+                    .put(']');
+        }
+
+        long rowGroupStartRow = cachedRowGroupStartRow;
+        for (int i = cachedRowGroupIndex; i < rowGroupCount; i++) {
+            final long rowGroupSize = metadata.getRowGroupSize(i);
+            final long rowGroupEndRow = rowGroupStartRow + rowGroupSize;
+
+            if (partitionLo < rowGroupEndRow) {
+                if (filterBufEnd != -1 && ParquetRowGroupFilter.canSkipRowGroup(
+                        i,
+                        metadata,
+                        filterList,
+                        filterBufEnd
+                )) {
+                    partitionLo = rowGroupEndRow;
+                    if (partitionLo >= partitionHi) {
+                        reenterPartitionFrame = false;
+                        return null;
+                    }
+                    rowGroupStartRow = rowGroupEndRow;
+                    continue;
+                }
+
+                // Found a non-skippable row group
+                final long adjustedHi = Math.min(partitionHi, rowGroupEndRow);
+                if (adjustedHi < partitionHi) {
+                    reenterPartitionLo = adjustedHi;
+                    reenterPartitionHi = partitionHi;
+                    reenterPartitionFrame = true;
+                } else {
+                    reenterPartitionFrame = false;
+                }
+
+                cachedRowGroupIndex = i + 1;
+                cachedRowGroupStartRow = rowGroupEndRow;
+
+                remainingRowsInInterval = partitionHi - adjustedHi;
+
+                frame.parquetMetaDecoder = reenterParquetDecoder;
+                frame.partitionLo = partitionLo;
+                frame.partitionHi = adjustedHi;
+                // Symbol indexes store index rows, see ParquetMetaFileReader#getRowGroupIndexRowLo.
+                frame.pieceShift = metadata.getRowGroupIndexRowLo(i, rowGroupStartRow) - rowGroupStartRow;
+                frame.skipSkeleton = false;
+                frame.format = PartitionFormat.PARQUET;
+                frame.rowGroupIndex = i;
+                frame.rowGroupLo = (int) (partitionLo - rowGroupStartRow);
+                frame.rowGroupHi = (int) (adjustedHi - rowGroupStartRow);
+                frame.partitionIndex = reenterPartitionIndex;
+                return frame;
+            }
+            rowGroupStartRow = rowGroupEndRow;
+        }
+
+        // partitionLo is beyond all row groups
+        reenterPartitionFrame = false;
+        return null;
+    }
+
+    private @Nullable TableReaderPageFrame nextSlow(PartitionFrame partitionFrame, long lo, long hi, long skipTarget) {
+        final byte format = partitionFrame.getPartitionFormat();
+        if (format == PartitionFormat.PARQUET) {
+            clearAddresses();
+            reenterParquetDecoder = partitionFrame.getParquetMetaDecoder();
+            reenterPageFrameRowLimit = 0;
+            cachedRowGroupIndex = 0;
+            cachedRowGroupStartRow = 0;
+            assert reenterParquetDecoder != null;
+            filterBufEnd = -1;
+            if (filterList != null && ParquetRowGroupFilter.prepareFilterList(
+                    reenterParquetDecoder.metadata(),
+                    pushdownFilterConditions,
+                    filterList,
+                    filterValues,
+                    // native-table partitions: resolve the Parquet column by stable id so a
+                    // renamed column maps correctly despite the frozen Parquet name.
+                    true
+            )) {
+                filterBufEnd = filterValues.getAddress() + filterValues.getAppendOffset();
+            }
+            return computeParquetFrame(lo, hi);
+        }
+
+        assert format == PartitionFormat.NATIVE;
+        reenterParquetDecoder = null;
+        reenterPageFrameRowLimit = NativeFrameBoundaries.calculatePageFrameRowLimit(lo, hi, pageFrameMinRows, pageFrameMaxRows, sharedQueryWorkerCount);
+        return computeNativeFrame(lo, hi, skipTarget);
+    }
+
+    public static long calculatePageFrameRowLimit(
+            long partitionLo,
+            long partitionHi,
+            long pageFrameMinRows,
+            long pageFrameMaxRows,
+            int sharedQueryWorkerCount
+    ) {
+        final int workerCount = Math.max(sharedQueryWorkerCount, 1);
+        long rowsPerFrame = Math.min(pageFrameMaxRows, Math.max(pageFrameMinRows, (partitionHi - partitionLo) / workerCount));
+        final long lastFrameSize = (partitionHi - partitionLo) % rowsPerFrame;
+        if (lastFrameSize > 0 && lastFrameSize < pageFrameMinRows) {
+            // Adjust the limit, so that we don't have tiny trailing frames.
+            final long frameCount = Math.max((partitionHi - partitionLo) / rowsPerFrame, 1);
+            rowsPerFrame += (lastFrameSize + frameCount - 1) / frameCount;
+        }
+        return rowsPerFrame;
+    }
+
+    /**
+     * Populates column tops for a partition from column version metadata.
+     * A column top value indicates the first row where the column has data;
+     * rows before the top are NULL. Columns that don't exist in this
+     * partition get top = partitionRowCount (all-null).
+     *
+     * @param columnTops          output list, cleared and populated with one entry per column
+     * @param tableReader         table reader (used for reader metadata)
+     * @param columnVersionReader column version reader
+     * @param columnIndexes       query-to-reader column index mapping
+     * @param columnCount         number of columns
+     * @param partitionTimestamp  partition timestamp
+     * @param partitionRowCount   partition row count
+     */
+    static void populateColumnTops(
+            LongList columnTops,
+            TableReader tableReader,
+            ColumnVersionReader columnVersionReader,
+            IntList columnIndexes,
+            int columnCount,
+            long partitionTimestamp,
+            long partitionRowCount
+    ) {
+        // Use reader metadata (not factory metadata) for writer index lookup,
+        // because factory metadata (e.g. SelectedRecordCursorFactory) may not
+        // implement getWriterIndex().
+        final RecordMetadata readerMetadata = tableReader.getMetadata();
+        columnTops.clear();
+        for (int i = 0; i < columnCount; i++) {
+            final int readerColumnIndex = columnIndexes.getQuick(i);
+            final int writerIndex = readerMetadata.getWriterIndex(readerColumnIndex);
+            final int recordIndex = columnVersionReader.getRecordIndex(partitionTimestamp, writerIndex);
+            if (recordIndex > -1) {
+                columnTops.add(columnVersionReader.getColumnTopByIndex(recordIndex));
+            } else if (columnVersionReader.getColumnTopPartitionTimestamp(writerIndex) <= partitionTimestamp) {
+                columnTops.add(0); // column exists from start, no top
+            } else {
+                columnTops.add(partitionRowCount); // column doesn't exist — all-null
+            }
+        }
+    }
+
+    private class TableReaderPageFrame implements PageFrame {
+        private byte format;
+        private ParquetPartitionDecoder parquetMetaDecoder;
+        private long partitionHi;
+        private int partitionIndex;
+        private long partitionLo;
+        private long pieceShift;
+        private int rowGroupHi;
+        private int rowGroupIndex;
+        private int rowGroupLo;
+        private boolean skipSkeleton;
+
+        @Override
+        public long getAuxPageAddress(int columnIndex) {
+            return columnPageAddresses.getQuick(2 * columnIndex + 1);
+        }
+
+        @Override
+        public long getAuxPageSize(int columnIndex) {
+            return pageSizes.getQuick(2 * columnIndex + 1);
+        }
+
+        @Override
+        public int getColumnCount() {
+            return columnCount;
+        }
+
+        @Override
+        public byte getFormat() {
+            return format;
+        }
+
+        @Override
+        public IndexReader getIndexReader(int columnIndex, int direction) {
+            return reader.getIndexReader(partitionIndex, columnIndexes.getQuick(columnIndex), direction);
+        }
+
+        @Override
+        public long getPageAddress(int columnIndex) {
+            return columnPageAddresses.getQuick(2 * columnIndex);
+        }
+
+        @Override
+        public long getPageSize(int columnIndex) {
+            return pageSizes.getQuick(2 * columnIndex);
+        }
+
+        @Override
+        public ParquetPartitionDecoder getParquetDecoder() {
+            assert parquetMetaDecoder != null || format != PartitionFormat.PARQUET;
+            return parquetMetaDecoder;
+        }
+
+        @Override
+        public int getParquetRowGroup() {
+            return rowGroupIndex;
+        }
+
+        @Override
+        public int getParquetRowGroupHi() {
+            return rowGroupHi;
+        }
+
+        @Override
+        public int getParquetRowGroupLo() {
+            return rowGroupLo;
+        }
+
+        @Override
+        public long getIndexRowHi() {
+            return partitionHi + pieceShift;
+        }
+
+        @Override
+        public long getIndexRowLo() {
+            return partitionLo + pieceShift;
+        }
+
+        @Override
+        public long getPartitionHi() {
+            return partitionHi;
+        }
+
+        @Override
+        public int getPartitionIndex() {
+            return partitionIndex;
+        }
+
+        @Override
+        public long getPartitionLo() {
+            return partitionLo;
+        }
+
+        @Override
+        public boolean isSkipSkeleton() {
+            return skipSkeleton;
+        }
+    }
+}

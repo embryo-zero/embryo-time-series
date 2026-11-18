@@ -1,0 +1,100 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cairo;
+
+import io.questdb.std.QuietCloseable;
+
+/**
+ * Per-table transaction scoreboard. Used as a MVCC building block:
+ * table readers acquire a transaction number lock in the scoreboard when
+ * going active. This way table writers and purge jobs (GC) can check
+ * if files associated with an older transaction can be deleted.
+ */
+public interface TxnScoreboard extends QuietCloseable {
+    int CHECKPOINT_ID = -1;
+    // Two virtual pins that stop partition purge from reclaiming the partition versions named by the table's
+    // two save point generations (an O3 rewrite leaves the old version on disk). Each id is a single slot
+    // holding one txn, so advance() alternates between EPOCH_ID_A and EPOCH_ID_B: the slot of the generation
+    // being overwritten takes the new txn, and the prior txn stays pinned in the other slot, because recovery
+    // may fall back to it. A concurrent O3PartitionPurgeJob therefore never finds either save point unprotected.
+    // Both ids are independent of CHECKPOINT_ID and of each other; TxnScoreboardV2.toInternalId() maps them
+    // to slots.
+    int EPOCH_ID_A = -2;
+    int EPOCH_ID_B = -3;
+    /**
+     * {@link #scanRangeHolders(long, long)}: nothing holds the range.
+     */
+    int RANGE_FREE = 0;
+    /**
+     * {@link #scanRangeHolders(long, long)}: a durable-epoch pin ({@link #EPOCH_ID_A} /
+     * {@link #EPOCH_ID_B}) holds the range. Blocks an in-place overwrite, not a copy.
+     */
+    int RANGE_HELD_BY_EPOCH = 1;
+    /**
+     * {@link #scanRangeHolders(long, long)}: a reader or a checkpoint holds the range. Blocks a copy
+     * too: something is reading those files.
+     */
+    int RANGE_HELD_BY_OTHER = 2;
+
+    boolean acquireTxn(int id, long txn);
+
+    int getEntryCount();
+
+    TableToken getTableToken();
+
+    boolean hasEarlierTxnLocks(long maxTxn);
+
+    /**
+     * Ignores min/max txn values and increments the counter. Must be called only when there is
+     * an active reader that already acquired this txn.
+     * <p>
+     * Used by io.questdb.cairo.pool.ReaderPool#getCopyOf()
+     */
+    boolean incrementTxn(int id, long txn);
+
+    boolean isOutdated(long txn);
+
+    boolean isRangeAvailable(long fromTxn, long toTxn);
+
+    boolean isTxnAvailable(long txn);
+
+    /**
+     * Reports in one pass who holds {@code [fromTxn, toTxn)}: a save point pin, anything else (a reader
+     * or a checkpoint), both, or nothing. Returns a mask of {@link #RANGE_HELD_BY_EPOCH} /
+     * {@link #RANGE_HELD_BY_OTHER}, or {@link #RANGE_FREE}.
+     * <p>
+     * The squash gate needs both answers: may it overwrite (nothing holds the range), and failing that may
+     * it copy (no reader or checkpoint holds it). Under adaptive a save point pin is always present, so one
+     * scan replaces two.
+     * <p>
+     * Purge callers use {@link #isRangeAvailable(long, long)} instead: they delete bytes a recovery rewind
+     * may still need, so a save point pin and a reader pin mean the same to them. Only a copy squash can act
+     * on the difference, because it deletes nothing: it writes a new partition version and queues the old
+     * one, whose removal goes back through the purge check.
+     */
+    int scanRangeHolders(long fromTxn, long toTxn);
+
+    long releaseTxn(int id, long txn);
+}

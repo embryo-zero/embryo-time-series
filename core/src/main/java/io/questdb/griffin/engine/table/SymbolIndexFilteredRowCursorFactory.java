@@ -1,0 +1,107 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.table;
+
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PageFrameMemory;
+import io.questdb.cairo.sql.RowCursor;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
+
+public class SymbolIndexFilteredRowCursorFactory implements SymbolFunctionRowCursorFactory {
+    private final int columnIndex;
+    private final SymbolIndexFilteredRowCursor cursor;
+    private final Function symbolFunction;
+
+    public SymbolIndexFilteredRowCursorFactory(
+            int columnIndex,
+            int symbolKey,
+            Function filter,
+            int indexDirection,
+            Function symbolFunction
+    ) {
+        this.columnIndex = columnIndex;
+        this.cursor = new SymbolIndexFilteredRowCursor(
+                columnIndex,
+                symbolKey,
+                filter,
+                indexDirection
+        );
+        this.symbolFunction = symbolFunction;
+    }
+
+    @Override
+    public RowCursor getCursor(PageFrame pageFrame, PageFrameMemory pageFrameMemory) {
+        return cursor.of(pageFrame, pageFrameMemory);
+    }
+
+    @Override
+    public Function getFunction() {
+        return symbolFunction;
+    }
+
+    public int getSymbolKey() {
+        return cursor.getSymbolKey() == 0 ? SymbolTable.VALUE_IS_NULL : cursor.getSymbolKey() - 1;
+    }
+
+    @Override
+    public boolean isEntity() {
+        return false;
+    }
+
+    // Both selecting values must be stable: the symbol key AND the residual index filter. A null key
+    // function means a compile-time-resolved constant key (stable); a single unstable source
+    // (e.g. rnd_* in either) makes the selected rows vary across opens.
+    @Override
+    public boolean isStableWithinExecution() {
+        final Function filter = cursor.getFilter();
+        return (symbolFunction == null || symbolFunction.isStableWithinExecution())
+                && (filter == null || filter.isStableWithinExecution());
+    }
+
+    @Override
+    public boolean isUsingIndex() {
+        return true;
+    }
+
+    @Override
+    public void of(int symbolKey) {
+        cursor.of(symbolKey);
+    }
+
+    @Override
+    public void prepareCursor(PageFrameCursor pageFrameCursor) {
+        cursor.prepare(pageFrameCursor);
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Index ").type(IndexReader.nameOf(cursor.getIndexDirection())).type(" scan").meta("on").putBaseColumnName(columnIndex);
+        sink.attr("filter").putBaseColumnName(columnIndex).val('=').val(cursor.getSymbolKey()).val(" and ").val(cursor.getFilter());
+    }
+}
